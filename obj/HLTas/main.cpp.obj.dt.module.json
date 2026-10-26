@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "C:\\Users\\ggiro\\OneDrive\\Документы\\HLTas\\obj\\HLTas\\main.obj",
+            "outputs": [
+                "C:\\Users\\ggiro\\OneDrive\\Документы\\HLTas\\obj\\HLTas\\main.cpp.obj.dt.module.json",
+                "C:\\Users\\ggiro\\OneDrive\\Документы\\HLTas\\obj\\HLTas\\main.cpp.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}
