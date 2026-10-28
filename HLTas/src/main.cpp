@@ -1,4 +1,4 @@
-// HLTas — этап 2: оверлей + управление временем + свои бинды для Half-Life 1 (GoldSrc, OpenGL)
+﻿// HLTas — этап 2: оверлей + управление временем + свои бинды для Half-Life 1 (GoldSrc, OpenGL)
 //  * цепляется к SwapBuffers и рисует поверх игры меню и HUD на ImGui (неоновая тема)
 //  * получает данные игрока через хук HUD_PlayerMove из client.dll
 //  * замедление — на стороне движка: подменяем источники времени Windows для кода hw.dll
@@ -213,15 +213,64 @@ static bool   g_paused = false;
 static bool   g_lsOn = false;                // пошаговое время воспроизведения включено
 static int    g_normalFps = 100;             // обычный fps_max, к которому возвращаемся
 static int    g_lastFps = 0;
-struct VisCfg { bool on; int style; float col[3]; float bright; bool through; };   // style: 0 = оттенок, 1 = плоский цвет, 2 = свечение
-static VisCfg g_chams = { false, 0,{ 1.0f, 0.15f, 0.85f }, 1.5f, false };
-static VisCfg g_weap = { false, 0,{ 0.0f, 0.93f, 1.0f }, 1.5f, false };
+struct VisCfg { bool on; int style; float col[3]; float bright; bool through; bool rainbow; float rspeed; };   // style: 0 = оттенок, 1 = плоский цвет, 2 = свечение
+static VisCfg g_chams = { false, 0,{ 1.0f, 0.15f, 0.85f }, 1.5f, false, false, 0.4f };
+static VisCfg g_weap = { false, 0,{ 0.0f, 0.93f, 1.0f }, 1.5f, false, false, 0.4f };
+
+// локальные настройки камеры и оружия (только для своей игры)
+struct ViewCfg
+{
+    bool fovOn; float fov; bool scopeKeep;         // поле зрения по горизонтали; не трогать оптику
+    bool aspectOn; float aspect;                   // растяжение картинки по горизонтали
+    bool vmFovOn; float vmFov;                     // поле зрения модели оружия
+    bool offOn; float off[3];                      // смещение оружия: вправо, вверх, вперёд
+    bool noRecoil;                                 // убрать визуальную отдачу
+    float tpDist;                                  // дистанция камеры от третьего лица
+};
+static ViewCfg g_view = { false, 100.0f, true, false, 1.0f, false, 90.0f, false,{ 0.0f, 0.0f, 0.0f }, false, 120.0f };
+static bool g_thirdPerson = false;
+static float g_engFovOrig = 0.0f;                  // default_fov до нашего вмешательства (0 = мы его не меняли)
+static float g_engFovSent = 0.0f;                  // какое значение default_fov мы выставили движку (0 = ничего)
+static unsigned long long g_engFovTick = 0;
+static int  g_viewHits[3] = { 0, 0, 0 };           // подмен за секунду: проекция мира / проекция оружия / отдача
+static int  g_viewHitsShown[3] = { 0, 0, 0 };
+
+// FPS booster: 0 = Engine (лимит кадров игры), 1 = Cmd (длина физического шага в команде движения)
+static bool g_fpsBoostOn = false;
+static int  g_fpsBoostMode = 0;
+static int  g_fpsBoostFps = 250;
+
+// плавная смена цвета (HSV -> RGB)
+static void RainbowColor(double t, float speed, float* o)
+{
+    float h = (float)fmod(t * (double)speed, 1.0);
+    if (h < 0.0f) h += 1.0f;
+    int i = (int)(h * 6.0f);
+    float f = h * 6.0f - (float)i, q = 1.0f - f;
+    switch (i % 6) {
+    case 0: o[0] = 1; o[1] = f; o[2] = 0; break;
+    case 1: o[0] = q; o[1] = 1; o[2] = 0; break;
+    case 2: o[0] = 0; o[1] = 1; o[2] = f; break;
+    case 3: o[0] = 0; o[1] = q; o[2] = 1; break;
+    case 4: o[0] = f; o[1] = 0; o[2] = 1; break;
+    default: o[0] = 1; o[1] = 0; o[2] = q; break;
+    }
+}
 static int    g_visHits[2] = { 0, 0 };           // сколько вызовов цвета подменено (модели / оружие)
 static int    g_visHitsShown[2] = { 0, 0 };
 static unsigned long long g_visTick = 0;
+static bool   g_forceNoVsync = false;        // принудительно отключать вертикальную синхронизацию
+static bool   g_vsyncDirty = false;
+static bool   g_visProfile = false;          // измерять затраты на подсветку моделей
+static double g_visCostShown = 0.0;          // мс за секунду
+static double g_overlayAvgMs = 0.0;          // сколько в среднем занимает отрисовка оверлея за кадр
+static long long g_ovTicks = 0;
+static int    g_ovFrames = 0;
 static bool   g_glHooksOk = false;
 static int    g_glColorHooks = 0;
 static bool   g_hookGdiSwap = true;
+static bool   g_swapIat = true;                // ставить перехват кадра в таблицу импорта движка (дружит с OBS/Discord), а не править сами функции
+static DWORD  g_glThread = 0;                // поток, в котором работает рендер игры
 static std::string g_hookedMap;              // имя карты, замеченное при открытии файла .bsp
 static char   g_replayMsg[120] = "";
 static float  g_replayMsgT = 0.0f;
@@ -443,6 +492,244 @@ static std::string CurrentMapName()
     }
     return g_hookedMap;
 }
+
+// ---- модели игры (.mdl, формат GoldSrc "IDST", версия 10): разбор для превью в меню
+struct MdlTex { std::string name; int w = 0, h = 0, flags = 0; std::vector<unsigned char> rgba; unsigned int gl = 0; };
+struct MdlMesh { int tex = -1; std::vector<float> v; };      // треугольники, по 8 float на вершину: x y z nx ny nz u v
+struct MdlModel
+{
+    std::string path;
+    bool ok = false;
+    std::vector<MdlTex> tex;
+    std::vector<MdlMesh> meshes;
+    float mn[3] = { 0, 0, 0 }, mx[3] = { 0, 0, 0 };
+    int tris = 0;
+};
+
+static bool ParseMdl(const std::vector<unsigned char>& d, const std::vector<unsigned char>* td, MdlModel& out, std::string& err)
+{
+    typedef std::vector<unsigned char> Bytes;
+    auto rdi = [](const Bytes& b, size_t o) -> int { int v = 0; if (o + 4 <= b.size()) memcpy(&v, &b[o], 4); return v; };
+    auto rdf = [](const Bytes& b, size_t o) -> float { float v = 0; if (o + 4 <= b.size()) memcpy(&v, &b[o], 4); return v; };
+    auto rds = [](const Bytes& b, size_t o) -> int { short v = 0; if (o + 2 <= b.size()) memcpy(&v, &b[o], 2); return v; };
+    auto rdu = [](const Bytes& b, size_t o) -> int { unsigned short v = 0; if (o + 2 <= b.size()) memcpy(&v, &b[o], 2); return v; };
+
+    if (d.size() < 244) { err = "file is too small"; return false; }
+    int id = rdi(d, 0);
+    if (id == 0x51534449) { err = "this is a sequence file, not a model"; return false; }   // "IDSQ"
+    if (id != 0x54534449) { err = "not a studio model"; return false; }                      // "IDST"
+    if (rdi(d, 4) != 10) { err = "unsupported model version"; return false; }
+
+    // ---- кости
+    int nb = rdi(d, 140), bi = rdi(d, 144);
+    if (nb < 0 || nb > 128 || bi < 0 || (size_t)bi + (size_t)nb * 112 > d.size()) { err = "bad bone table"; return false; }
+    struct Bone { int parent; float val[6], scl[6]; };
+    std::vector<Bone> bones((size_t)nb);
+    for (int i = 0; i < nb; ++i) {
+        size_t o = (size_t)bi + (size_t)i * 112;
+        bones[i].parent = rdi(d, o + 32);
+        for (int k = 0; k < 6; ++k) { bones[i].val[k] = rdf(d, o + 64 + k * 4); bones[i].scl[k] = rdf(d, o + 88 + k * 4); }
+    }
+
+    // ---- поза: первый кадр «простой» анимации (activity = 1), иначе первая из основной группы
+    int nseq = rdi(d, 164), seqi = rdi(d, 168);
+    long animBase = -1;
+    if (nseq > 0 && seqi > 0) {
+        int pick = -1;
+        for (int i = 0; i < nseq && i < 4096; ++i) {
+            size_t o = (size_t)seqi + (size_t)i * 176;
+            if (o + 176 > d.size()) break;
+            if (rdi(d, o + 156) != 0) continue;                  // анимация лежит в другом файле
+            if (pick < 0) pick = i;
+            if (rdi(d, o + 40) == 1) { pick = i; break; }
+        }
+        if (pick >= 0) {
+            int ai = rdi(d, (size_t)seqi + (size_t)pick * 176 + 124);
+            if (ai > 0 && (size_t)ai < d.size()) animBase = ai;
+        }
+    }
+    auto animValue = [&](size_t ab, int ch, float& outv) -> bool {
+        int off = rdu(d, ab + (size_t)ch * 2);
+        if (off == 0) return false;
+        size_t p = ab + (size_t)off;
+        int k = 0;                                               // кадр 0
+        for (int guard = 0; guard < 4096; ++guard) {
+            if (p + 2 > d.size()) return false;
+            int valid = d[p], total = d[p + 1];
+            if (total == 0) return false;
+            if (total <= k) { k -= total; p += (size_t)(valid + 1) * 2; continue; }
+            outv = (float)(valid > k ? rds(d, p + (size_t)(k + 1) * 2) : rds(d, p + (size_t)valid * 2));
+            return true;
+        }
+        return false;
+        };
+
+    std::vector<float> M((size_t)nb * 12, 0.0f);                 // матрицы 3x4 по кости
+    for (int b = 0; b < nb; ++b) {
+        float pos[3], ang[3];
+        size_t ab = animBase >= 0 ? (size_t)animBase + (size_t)b * 12 : 0;
+        for (int j = 0; j < 3; ++j) {
+            pos[j] = bones[b].val[j];
+            ang[j] = bones[b].val[3 + j];
+            float v;
+            if (animBase >= 0 && ab + 12 <= d.size()) {
+                if (animValue(ab, j, v))     pos[j] += v * bones[b].scl[j];
+                if (animValue(ab, 3 + j, v)) ang[j] += v * bones[b].scl[3 + j];
+            }
+        }
+        float sy = sinf(ang[2] * 0.5f), cy = cosf(ang[2] * 0.5f);
+        float sp = sinf(ang[1] * 0.5f), cp = cosf(ang[1] * 0.5f);
+        float sr = sinf(ang[0] * 0.5f), cr = cosf(ang[0] * 0.5f);
+        float q0 = sr * cp * cy - cr * sp * sy, q1 = cr * sp * cy + sr * cp * sy;
+        float q2 = cr * cp * sy - sr * sp * cy, q3 = cr * cp * cy + sr * sp * sy;
+        float m[3][4];
+        m[0][0] = 1.0f - 2.0f * q1 * q1 - 2.0f * q2 * q2;
+        m[1][0] = 2.0f * q0 * q1 + 2.0f * q3 * q2;
+        m[2][0] = 2.0f * q0 * q2 - 2.0f * q3 * q1;
+        m[0][1] = 2.0f * q0 * q1 - 2.0f * q3 * q2;
+        m[1][1] = 1.0f - 2.0f * q0 * q0 - 2.0f * q2 * q2;
+        m[2][1] = 2.0f * q1 * q2 + 2.0f * q3 * q0;
+        m[0][2] = 2.0f * q0 * q2 + 2.0f * q3 * q1;
+        m[1][2] = 2.0f * q1 * q2 - 2.0f * q3 * q0;
+        m[2][2] = 1.0f - 2.0f * q0 * q0 - 2.0f * q1 * q1;
+        m[0][3] = pos[0]; m[1][3] = pos[1]; m[2][3] = pos[2];
+        float* o = &M[(size_t)b * 12];
+        int par = bones[b].parent;
+        if (par >= 0 && par < b) {
+            const float* P = &M[(size_t)par * 12];
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) o[r * 4 + c] = P[r * 4 + 0] * m[0][c] + P[r * 4 + 1] * m[1][c] + P[r * 4 + 2] * m[2][c];
+                o[r * 4 + 3] = P[r * 4 + 0] * m[0][3] + P[r * 4 + 1] * m[1][3] + P[r * 4 + 2] * m[2][3] + P[r * 4 + 3];
+            }
+        }
+        else {
+            for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) o[r * 4 + c] = m[r][c];
+        }
+    }
+
+    // ---- текстуры: если в модели их нет, берутся из парного файла (имя + "T")
+    const Bytes& tb = (rdi(d, 180) == 0 && td && td->size() >= 244) ? *td : d;
+    int ntex = rdi(tb, 180), texi = rdi(tb, 184), nref = rdi(tb, 192), nfam = rdi(tb, 196), skini = rdi(tb, 200);
+    out = MdlModel();
+    if (ntex < 0 || ntex > 256) ntex = 0;
+    for (int t = 0; t < ntex; ++t) {
+        MdlTex tx;
+        size_t o = (size_t)texi + (size_t)t * 80;
+        if (texi <= 0 || o + 80 > tb.size()) { out.tex.push_back(tx); continue; }
+        for (int k = 0; k < 64 && tb[o + k]; ++k) tx.name += (char)tb[o + k];
+        tx.flags = rdi(tb, o + 64);
+        int w = rdi(tb, o + 68), h = rdi(tb, o + 72), idx = rdi(tb, o + 76);
+        if (w > 0 && h > 0 && w <= 2048 && h <= 2048 && idx > 0 && (size_t)idx + (size_t)w * h + 768 <= tb.size()) {
+            tx.w = w; tx.h = h;
+            tx.rgba.resize((size_t)w * h * 4);
+            const unsigned char* pal = &tb[(size_t)idx + (size_t)w * h];
+            for (int i = 0; i < w * h; ++i) {
+                unsigned char px = tb[(size_t)idx + i];
+                tx.rgba[(size_t)i * 4 + 0] = pal[px * 3 + 0];
+                tx.rgba[(size_t)i * 4 + 1] = pal[px * 3 + 1];
+                tx.rgba[(size_t)i * 4 + 2] = pal[px * 3 + 2];
+                tx.rgba[(size_t)i * 4 + 3] = ((tx.flags & 0x40) && px == 255) ? 0 : 255;   // маска: индекс 255 прозрачный
+            }
+        }
+        out.tex.push_back(tx);
+    }
+    std::vector<int> skin;
+    if (nref > 0 && nref < 4096 && nfam > 0 && skini > 0) for (int r = 0; r < nref; ++r) skin.push_back(rds(tb, (size_t)skini + (size_t)r * 2));
+
+    // ---- геометрия: у каждой части тела берётся первая подмодель
+    int nbp = rdi(d, 204), bpi = rdi(d, 208);
+    if (nbp < 0 || nbp > 64 || bpi <= 0) { err = "no body parts"; return false; }
+    bool first = true;
+    for (int bp = 0; bp < nbp; ++bp) {
+        size_t bo = (size_t)bpi + (size_t)bp * 76;
+        if (bo + 76 > d.size()) break;
+        int nummodels = rdi(d, bo + 64), mi = rdi(d, bo + 72);
+        if (nummodels < 1 || mi <= 0 || (size_t)mi + 112 > d.size()) continue;
+        size_t mo = (size_t)mi;
+        int nmesh = rdi(d, mo + 72), meshi = rdi(d, mo + 76);
+        int nverts = rdi(d, mo + 80), vinfo = rdi(d, mo + 84), vidx = rdi(d, mo + 88);
+        int nnorms = rdi(d, mo + 92), ninfo = rdi(d, mo + 96), nidx = rdi(d, mo + 100);
+        if (nmesh < 0 || nmesh > 4096 || nverts <= 0 || nverts > 65535 || nnorms < 0 || nnorms > 65535) continue;
+        if (vinfo <= 0 || vidx <= 0 || nidx <= 0 || ninfo <= 0 || meshi <= 0) continue;
+        if ((size_t)vidx + (size_t)nverts * 12 > d.size() || (size_t)vinfo + (size_t)nverts > d.size()) continue;
+        if ((size_t)nidx + (size_t)nnorms * 12 > d.size() || (size_t)ninfo + (size_t)nnorms > d.size()) continue;
+
+        for (int m = 0; m < nmesh; ++m) {
+            size_t me = (size_t)meshi + (size_t)m * 20;
+            if (me + 20 > d.size()) break;
+            int triindex = rdi(d, me + 4), skinref = rdi(d, me + 8);
+            if (triindex <= 0) continue;
+            MdlMesh mesh;
+            mesh.tex = (skinref >= 0 && (size_t)skinref < skin.size()) ? skin[skinref] : 0;
+            if (mesh.tex < 0 || (size_t)mesh.tex >= out.tex.size()) mesh.tex = out.tex.empty() ? -1 : 0;
+            float tw = 1.0f, th = 1.0f;
+            if (mesh.tex >= 0 && out.tex[mesh.tex].w > 0) { tw = (float)out.tex[mesh.tex].w; th = (float)out.tex[mesh.tex].h; }
+
+            size_t p = (size_t)triindex;
+            for (int guard = 0; guard < 200000; ++guard) {
+                if (p + 2 > d.size()) break;
+                int cnt = rds(d, p);
+                p += 2;
+                if (cnt == 0) break;
+                bool fan = cnt < 0;
+                if (fan) cnt = -cnt;
+                if (p + (size_t)cnt * 8 > d.size()) break;
+                std::vector<float> vv((size_t)cnt * 8);
+                bool bad = false;
+                for (int k = 0; k < cnt; ++k, p += 8) {
+                    int vi = rds(d, p), ni = rds(d, p + 2), s = rds(d, p + 4), t = rds(d, p + 6);
+                    if (vi < 0 || vi >= nverts || ni < 0 || ni >= nnorms) { bad = true; continue; }
+                    int vb = d[(size_t)vinfo + vi], nbn = d[(size_t)ninfo + ni];
+                    if (vb >= nb || nbn >= nb) { bad = true; continue; }
+                    float x = rdf(d, (size_t)vidx + (size_t)vi * 12), y = rdf(d, (size_t)vidx + (size_t)vi * 12 + 4), z = rdf(d, (size_t)vidx + (size_t)vi * 12 + 8);
+                    float nx = rdf(d, (size_t)nidx + (size_t)ni * 12), ny = rdf(d, (size_t)nidx + (size_t)ni * 12 + 4), nz = rdf(d, (size_t)nidx + (size_t)ni * 12 + 8);
+                    const float* A = &M[(size_t)vb * 12];
+                    const float* B = &M[(size_t)nbn * 12];
+                    float* o = &vv[(size_t)k * 8];
+                    o[0] = A[0] * x + A[1] * y + A[2] * z + A[3];
+                    o[1] = A[4] * x + A[5] * y + A[6] * z + A[7];
+                    o[2] = A[8] * x + A[9] * y + A[10] * z + A[11];
+                    o[3] = B[0] * nx + B[1] * ny + B[2] * nz;
+                    o[4] = B[4] * nx + B[5] * ny + B[6] * nz;
+                    o[5] = B[8] * nx + B[9] * ny + B[10] * nz;
+                    o[6] = (float)s / tw;
+                    o[7] = (float)t / th;
+                }
+                if (bad) continue;
+                for (int k = 2; k < cnt; ++k) {                  // полоса или веер -> треугольники
+                    int a, b2, c;
+                    if (fan) { a = 0; b2 = k - 1; c = k; }
+                    else if (k & 1) { a = k - 1; b2 = k - 2; c = k; }
+                    else { a = k - 2; b2 = k - 1; c = k; }
+                    const int idx3[3] = { a, b2, c };
+                    for (int q = 0; q < 3; ++q) {
+                        const float* v = &vv[(size_t)idx3[q] * 8];
+                        for (int e = 0; e < 8; ++e) mesh.v.push_back(v[e]);
+                        if (first) { out.mn[0] = out.mx[0] = v[0]; out.mn[1] = out.mx[1] = v[1]; out.mn[2] = out.mx[2] = v[2]; first = false; }
+                        for (int e = 0; e < 3; ++e) { if (v[e] < out.mn[e]) out.mn[e] = v[e]; if (v[e] > out.mx[e]) out.mx[e] = v[e]; }
+                    }
+                    ++out.tris;
+                }
+                if (out.tris > 300000) break;
+            }
+            if (!mesh.v.empty()) out.meshes.push_back(std::move(mesh));
+        }
+    }
+    if (out.meshes.empty()) { err = "model has no drawable geometry"; return false; }
+    out.ok = true;
+    return true;
+}
+// превью: выбранные модели игры
+static std::vector<std::string> g_models;        // пути относительно папки игры, например "valve\\models\\scientist.mdl"
+static bool g_modelsScanned = false;
+static MdlModel g_pvMdl[2];                      // 0 = модели, 1 = оружие
+static std::string g_pvPath[2];
+static std::string g_pvMsg[2];
+static std::vector<unsigned int> g_staleTex;     // текстуры OpenGL, которые надо удалить в потоке рендера
+static float g_pvAngle[2] = { 0.6f, 0.6f };
+static void EnsurePreviewModels();
+static void ScanModels();
+static void LoadPreviewModel(int kind, const std::string& rel);
 // ===== RECORDER-DATA-END =============================================================
 
 
@@ -459,7 +746,7 @@ static inline bool PmFresh()
 
 static bool    g_init = false;
 static bool    g_menu = false;
-static bool    g_inSwap = false;
+static thread_local bool g_inSwap = false;
 static HWND    g_hwnd = nullptr;
 static WNDPROC g_origWndProc = nullptr;
 static POINT   g_center = { 0, 0 };
@@ -679,6 +966,127 @@ static void EnsureMapFor(const std::string& name)
     LoadMapByName(name);
 }
 
+// ---------------------------------------------------------------- превью-модели: список файлов и загрузка
+static bool EndsWithNoCase(const std::string& s, const char* suf)
+{
+    size_t n = strlen(suf);
+    return s.size() >= n && _stricmp(s.c_str() + s.size() - n, suf) == 0;
+}
+
+static bool ReadWholeFile(const std::string& path, std::vector<unsigned char>& out)
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    bool ok = sz > 0 && sz < 64 * 1024 * 1024;
+    if (ok) { out.resize((size_t)sz); ok = fread(out.data(), 1, out.size(), f) == out.size(); }
+    fclose(f);
+    return ok;
+}
+
+static void ScanModelDir(const std::string& root, const std::string& rel, int depth)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((root + rel + "*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::string name = fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (name != "." && name != ".." && depth < 4) ScanModelDir(root, rel + name + "\\", depth + 1);
+        }
+        else if (EndsWithNoCase(name, ".mdl") && g_models.size() < 20000) {
+            std::string stem = name.substr(0, name.size() - 4);
+            bool skip = false;
+            if (stem.size() >= 2 && isdigit((unsigned char)stem[stem.size() - 1]) && isdigit((unsigned char)stem[stem.size() - 2])) skip = true;   // файлы с анимациями (player01.mdl)
+            if (!stem.empty() && (stem.back() == 'T' || stem.back() == 't')) {                                                                        // файл с текстурами (name + T)
+                std::string base = root + rel + stem.substr(0, stem.size() - 1) + ".mdl";
+                if (GetFileAttributesA(base.c_str()) != INVALID_FILE_ATTRIBUTES) skip = true;
+            }
+            if (!skip) g_models.push_back(rel + name);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static void ScanModels()
+{
+    g_models.clear();
+    std::string root = ExeDir();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((root + "*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.') {
+                std::string d = fd.cFileName;
+                if (GetFileAttributesA((root + d + "\\models").c_str()) != INVALID_FILE_ATTRIBUTES) ScanModelDir(root, d + "\\models\\", 0);
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    std::sort(g_models.begin(), g_models.end(), [](const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) < 0; });
+    g_modelsScanned = true;
+    Log("model list: %d models found", (int)g_models.size());
+}
+
+static void LoadPreviewModel(int kind, const std::string& rel)
+{
+    for (const MdlTex& t : g_pvMdl[kind].tex) if (t.gl) g_staleTex.push_back(t.gl);
+    g_pvMdl[kind] = MdlModel();
+    g_pvPath[kind] = rel;
+    g_pvMsg[kind].clear();
+    std::string full = ExeDir() + rel;
+    std::vector<unsigned char> d, t;
+    if (!ReadWholeFile(full, d)) { g_pvMsg[kind] = "cannot read the file"; return; }
+    std::string tp = full.substr(0, full.size() - 4) + "T.mdl";
+    bool hasT = ReadWholeFile(tp, t);
+    MdlModel m;
+    std::string err;
+    if (!ParseMdl(d, hasT ? &t : nullptr, m, err)) { g_pvMsg[kind] = err; Log("model %s: %s", rel.c_str(), err.c_str()); return; }
+    m.path = rel;
+    g_pvMdl[kind] = std::move(m);
+    Log("model %s loaded: %d triangles, %d textures", rel.c_str(), g_pvMdl[kind].tris, (int)g_pvMdl[kind].tex.size());
+}
+
+static std::string FindModelByName(const char* const* names, int n)
+{
+    for (int i = 0; i < n; ++i)
+        for (const std::string& m : g_models) {
+            size_t sl = m.find_last_of("\\/");
+            std::string fn = sl == std::string::npos ? m : m.substr(sl + 1);
+            if (_stricmp(fn.c_str(), names[i]) == 0) return m;
+        }
+    return std::string();
+}
+
+// при первом открытии страницы: список моделей, сохранённые или подходящие по умолчанию модели
+static void EnsurePreviewModels()
+{
+    static bool init = false;
+    if (init) return;
+    init = true;
+    if (!g_modelsScanned) ScanModels();
+    for (int kind = 0; kind < 2; ++kind) {
+        if (!g_pvPath[kind].empty() && GetFileAttributesA((ExeDir() + g_pvPath[kind]).c_str()) != INVALID_FILE_ATTRIBUTES) {
+            LoadPreviewModel(kind, g_pvPath[kind]);
+            continue;
+        }
+        std::string pick;
+        if (kind == 1) {
+            static const char* w[] = { "v_knife.mdl", "v_9mmhandgun.mdl", "v_usp.mdl", "v_ak47.mdl", "v_mp5.mdl", "v_crowbar.mdl" };
+            pick = FindModelByName(w, 6);
+            if (pick.empty()) for (const std::string& m : g_models) { size_t sl = m.find_last_of("\\/"); if (m.compare(sl + 1, 2, "v_") == 0) { pick = m; break; } }
+        }
+        else {
+            static const char* w[] = { "scientist.mdl", "barney.mdl", "zombie.mdl", "hgrunt.mdl", "vip.mdl", "gign.mdl", "headcrab.mdl" };
+            pick = FindModelByName(w, 7);
+            if (pick.empty()) for (const std::string& m : g_models) { size_t sl = m.find_last_of("\\/"); if (m.compare(sl + 1, 2, "v_") != 0 && m.compare(sl + 1, 2, "w_") != 0 && m.compare(sl + 1, 2, "p_") != 0) { pick = m; break; } }
+        }
+        if (!pick.empty()) LoadPreviewModel(kind, pick);
+    }
+}
+
 static void SelectRun(const RunInfo& ri)
 {
     Run r;
@@ -833,10 +1241,10 @@ typedef void (*DrawTrans_t)(void);
 static DrawTrans_t oDrawTrans = nullptr;
 static bool g_hookDrawTrans = false;
 
-static void DrawTrailLines(const std::vector<Frame>& fr, float alpha)
+static void DrawTrailLines(const std::vector<Frame>& fr, float alpha, size_t maxPts = 6000)
 {
     if (fr.size() < 2) return;
-    size_t step = fr.size() > 6000 ? fr.size() / 6000 : 1;
+    size_t step = fr.size() > maxPts ? fr.size() / maxPts : 1;
     glBegin(GL_LINE_STRIP);
     for (size_t i = 0; i < fr.size(); i += step) {
         const Frame& f = fr[i];
@@ -850,6 +1258,26 @@ static void DrawTrailLines(const std::vector<Frame>& fr, float alpha)
     glColor4f(c.x, c.y, c.z, alpha);
     glVertex3f(l.pos.x, l.pos.y, l.pos.z - ((l.flags & FR_DUCK) ? 18.0f : 36.0f) + 1.0f);
     glEnd();
+}
+
+// путь открытого забега не меняется, поэтому один раз «записываем» его в дисплей-лист OpenGL и дальше просто вызываем
+static unsigned int g_trailList = 0;
+static int    g_trailListVer = -1;
+static size_t g_trailListSize = 0;
+
+static void EnsureTrailLists()
+{
+    if (g_trailList && g_trailListVer == g_curVer && g_trailListSize == g_cur.frames.size()) return;
+    if (g_trailList) glDeleteLists(g_trailList, 2);
+    g_trailList = glGenLists(2);
+    glNewList(g_trailList, GL_COMPILE);
+    DrawTrailLines(g_cur.frames, 0.95f);
+    glEndList();
+    glNewList(g_trailList + 1, GL_COMPILE);
+    DrawTrailLines(g_cur.frames, 0.45f);
+    glEndList();
+    g_trailListVer = g_curVer;
+    g_trailListSize = g_cur.frames.size();
 }
 
 static void DrawTrail3D()
@@ -869,8 +1297,8 @@ static void DrawTrail3D()
     if (g_trailThrough) glDisable(GL_DEPTH_TEST); else glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     glLineWidth(3.0f);
-    if (haveCur) DrawTrailLines(g_cur.frames, g_rec ? 0.45f : 0.95f);
-    if (haveRec) DrawTrailLines(g_recRun.frames, 1.0f);
+    if (haveCur) { EnsureTrailLists(); glCallList(g_trailList + (g_rec ? 1 : 0)); }
+    if (haveRec) DrawTrailLines(g_recRun.frames, 1.0f, 2500);
     glPopAttrib();
 }
 
@@ -1021,6 +1449,7 @@ static bool TeleportToFrame(const Frame& f, const PlayerMove* pm)
 }
 
 static void SendFps(int fps);
+static int  BaseFps();
 static void ApplySlow();
 static void LsBegin(int firstMs);
 static void LsEnd();
@@ -1044,7 +1473,7 @@ static void StopReplay(const char* why)
     g_replayActive = false;
     g_replayPhase = 0;
     g_replayRun = Run();
-    if (g_replayFpsChanged) { SendFps(g_normalFps); g_replayFpsChanged = false; }
+    if (g_replayFpsChanged) { SendFps(BaseFps()); g_replayFpsChanged = false; }
     if (g_vsyncChanged) { Cmd("gl_vsync %s", g_vsyncSaved.c_str()); g_vsyncChanged = false; }
     ApplySlow();
 }
@@ -1459,6 +1888,15 @@ static glColor4ub_t   oGlColor4ub = nullptr;
 static bool g_inView = false;               // сейчас рисуется модель оружия
 static bool g_visPushed = false;            // состояние OpenGL сохранено, идёт подменённая модель
 static const VisCfg* g_visCfg = nullptr;
+static float g_visRgb[3] = { 1, 1, 1 };    // текущий цвет подсветки (с учётом радуги)
+
+// Состояние OpenGL меняем только когда стиль этого требует (Tint не трогает ничего, кроме цвета),
+// и возвращаем точечно, без glPushAttrib/glPopAttrib: они дорогие, а вызываются на каждую полосу треугольников.
+static double g_dpN = 0.0, g_dpF = 1.0;       // последний диапазон глубины, который задал движок
+static double g_visTimeSec = 0.0;             // время для радуги, обновляется раз в кадр
+static bool   g_visTexWasOn = false, g_visBlendWasOn = false, g_visMaskWas = true, g_visDepthTouched = false;
+static GLint  g_visSrc = GL_SRC_ALPHA, g_visDst = GL_ONE_MINUS_SRC_ALPHA;
+static long long g_visTicks = 0;              // накопленное время работы подмен (если включено измерение)
 
 static NOINLINE void WINAPI hkGlBegin(GLenum mode)
 {
@@ -1466,12 +1904,30 @@ static NOINLINE void WINAPI hkGlBegin(GLenum mode)
     if ((mode == GL_TRIANGLE_STRIP || mode == GL_TRIANGLE_FAN) && !g_visPushed && FromEngine(ret)) {
         const VisCfg* c = g_inView ? &g_weap : &g_chams;
         if (c->on) {
-            glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_TEXTURE_BIT);
+            long long t0 = 0;
+            if (g_visProfile && oQPC) { LARGE_INTEGER q; oQPC(&q); t0 = q.QuadPart; }
             g_visPushed = true;
             g_visCfg = c;
-            if (c->style != 0) glDisable(GL_TEXTURE_2D);
-            if (c->style == 2) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE); glDepthMask(GL_FALSE); }
-            if (c->through && !g_inView) glDepthRange(0.0, 0.02);        // «поверх стен»: модель ближе всего остального
+            g_visTexWasOn = false;
+            g_visDepthTouched = false;
+            if (c->rainbow) RainbowColor(g_visTimeSec, c->rspeed, g_visRgb);
+            else { g_visRgb[0] = c->col[0]; g_visRgb[1] = c->col[1]; g_visRgb[2] = c->col[2]; }
+            if (c->style != 0) {
+                g_visTexWasOn = glIsEnabled(GL_TEXTURE_2D) != GL_FALSE;
+                if (g_visTexWasOn) glDisable(GL_TEXTURE_2D);
+            }
+            if (c->style == 2) {
+                g_visBlendWasOn = glIsEnabled(GL_BLEND) != GL_FALSE;
+                GLboolean m = GL_TRUE;
+                glGetBooleanv(GL_DEPTH_WRITEMASK, &m);
+                g_visMaskWas = m != GL_FALSE;
+                if (g_visBlendWasOn) { glGetIntegerv(GL_BLEND_SRC, &g_visSrc); glGetIntegerv(GL_BLEND_DST, &g_visDst); }   // если смешивание было выключено, формула смешивания не важна
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                glDepthMask(GL_FALSE);
+            }
+            if (c->through && !g_inView) { glDepthRange(0.0, 0.02); g_visDepthTouched = true; }   // «поверх стен»
+            if (t0) { LARGE_INTEGER q; oQPC(&q); g_visTicks += q.QuadPart - t0; }
         }
     }
     oGlBegin(mode);
@@ -1480,13 +1936,129 @@ static NOINLINE void WINAPI hkGlBegin(GLenum mode)
 static NOINLINE void WINAPI hkGlEnd(void)
 {
     oGlEnd();
-    if (g_visPushed) { glPopAttrib(); g_visPushed = false; g_visCfg = nullptr; }
+    if (g_visPushed) {
+        long long t0 = 0;
+        if (g_visProfile && oQPC) { LARGE_INTEGER q; oQPC(&q); t0 = q.QuadPart; }
+        const VisCfg* c = g_visCfg;
+        if (c) {
+            if (c->style != 0 && g_visTexWasOn) glEnable(GL_TEXTURE_2D);
+            if (c->style == 2) {
+                if (!g_visBlendWasOn) glDisable(GL_BLEND);
+                else glBlendFunc((GLenum)g_visSrc, (GLenum)g_visDst);
+                glDepthMask(g_visMaskWas ? GL_TRUE : GL_FALSE);
+            }
+            if (g_visDepthTouched) glDepthRange(g_dpN, g_dpF);
+        }
+        g_visPushed = false;
+        g_visCfg = nullptr;
+        if (t0) { LARGE_INTEGER q; oQPC(&q); g_visTicks += q.QuadPart - t0; }
+    }
+}
+
+// модель оружия движок рисует в суженном диапазоне глубины: на входе и выходе можно изменить проекцию и положение
+static float g_vmSavedProj[16], g_vmSavedMv[16];
+static bool  g_vmModified = false;
+
+static void VmBegin()
+{
+    if (!g_view.vmFovOn && !g_view.offOn) return;
+    GLint mm = GL_MODELVIEW;
+    glGetIntegerv(GL_MATRIX_MODE, &mm);
+    glMatrixMode(GL_PROJECTION);
+    glGetFloatv(GL_PROJECTION_MATRIX, g_vmSavedProj);
+    glMatrixMode(GL_MODELVIEW);
+    glGetFloatv(GL_MODELVIEW_MATRIX, g_vmSavedMv);
+    if (g_view.vmFovOn && g_vmSavedProj[0] > 0.01f) {
+        float p[16];
+        memcpy(p, g_vmSavedProj, sizeof(p));
+        float target = 1.0f / tanf(g_view.vmFov * 3.14159265f / 360.0f);
+        float k = target / p[0];
+        p[0] *= k; p[5] *= k; p[8] *= k; p[9] *= k;
+        glMatrixMode(GL_PROJECTION);
+        glLoadMatrixf(p);
+    }
+    if (g_view.offOn) {
+        float mv[16];
+        memcpy(mv, g_vmSavedMv, sizeof(mv));
+        mv[12] += g_view.off[0];            // вправо
+        mv[13] += g_view.off[1];            // вверх
+        mv[14] -= g_view.off[2];            // вперёд (в системе камеры вперёд = минус z)
+        glMatrixMode(GL_MODELVIEW);
+        glLoadMatrixf(mv);
+    }
+    glMatrixMode((GLenum)mm);
+    g_vmModified = true;
+    ++g_viewHits[1];
+}
+
+static void VmEnd()
+{
+    if (!g_vmModified) return;
+    GLint mm = GL_MODELVIEW;
+    glGetIntegerv(GL_MATRIX_MODE, &mm);
+    glMatrixMode(GL_PROJECTION);
+    glLoadMatrixf(g_vmSavedProj);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadMatrixf(g_vmSavedMv);
+    glMatrixMode((GLenum)mm);
+    g_vmModified = false;
 }
 
 static NOINLINE void WINAPI hkGlDepthRange(GLclampd n, GLclampd f)
 {
-    if (FromEngine(CALLER())) g_inView = (f < 0.5 && n < 0.001);
+    if (FromEngine(CALLER())) {
+        g_dpN = n; g_dpF = f;
+        bool nowView = (f < 0.5 && n < 0.001);
+        if (nowView && !g_inView) VmBegin();
+        else if (!nowView && g_inView) VmEnd();
+        g_inView = nowView;
+    }
     oGlDepthRange(n, f);
+}
+
+// поле зрения мира и растяжение картинки: подправляем усечённую пирамиду, которую задаёт движок
+typedef void (WINAPI* glFrustum_t)(GLdouble, GLdouble, GLdouble, GLdouble, GLdouble, GLdouble);
+static glFrustum_t oGlFrustum = nullptr;
+
+static NOINLINE void WINAPI hkGlFrustum(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f)
+{
+    if ((g_view.fovOn || g_view.aspectOn) && n > 0.0 && r > l && t > b && FromEngine(CALLER())) {
+        double hx = (r - l) * 0.5, hy = (t - b) * 0.5, cx = (r + l) * 0.5, cy = (t + b) * 0.5;
+        double oldFov = 2.0 * atan(hx / n) * 180.0 / 3.14159265358979;
+        bool changed = false;
+        if (g_view.fovOn && !(g_view.scopeKeep && oldFov < 60.0)) {          // оптику (узкий угол) не трогаем
+            double k = tan((double)g_view.fov * 3.14159265358979 / 360.0) * n / hx;
+            hx *= k; hy *= k;
+            changed = true;
+        }
+        if (g_view.aspectOn) { hx *= (double)g_view.aspect; changed = true; }
+        if (changed) { l = cx - hx; r = cx + hx; b = cy - hy; t = cy + hy; ++g_viewHits[0]; }
+    }
+    oGlFrustum(l, r, b, t, n, f);
+}
+
+// визуальная отдача: перед расчётом камеры обнуляем punchangle в параметрах (смещение 160 в ref_params_s)
+typedef void (*CalcRefdef_t)(void*);
+static CalcRefdef_t oCalcRefdef = nullptr;
+static bool g_hookRefdef = false;
+
+static void hkCalcRefdef(void* params)
+{
+    if (g_view.noRecoil && params) {
+        float* pa = (float*)((char*)params + 160);
+        bool plausible = fabsf(pa[0]) < 45.0f && fabsf(pa[1]) < 45.0f && fabsf(pa[2]) < 45.0f;
+        const PlayerMove* pm = (const PlayerMove*)g_pm;
+        if (pm && plausible) {                                 // sanity: позиция камеры рядом с позицией игрока
+            const float* vo = (const float*)params;
+            float dx = vo[0] - pm->origin.x, dy = vo[1] - pm->origin.y, dz = vo[2] - pm->origin.z;
+            if (dx * dx + dy * dy + dz * dz > 250.0f * 250.0f) plausible = false;
+        }
+        if (plausible && (pa[0] != 0.0f || pa[1] != 0.0f || pa[2] != 0.0f)) {
+            pa[0] = pa[1] = pa[2] = 0.0f;
+            ++g_viewHits[2];
+        }
+    }
+    oCalcRefdef(params);
 }
 
 // подмена цвета вершины; возвращает true, если цвет заменён
@@ -1494,9 +2066,9 @@ static inline bool VisColor(float& r, float& g, float& b, float& a)
 {
     if (!g_visPushed || !g_visCfg) return false;
     const VisCfg& c = *g_visCfg;
-    if (c.style == 0) { r *= c.col[0] * c.bright; g *= c.col[1] * c.bright; b *= c.col[2] * c.bright; }
+    if (c.style == 0) { r *= g_visRgb[0] * c.bright; g *= g_visRgb[1] * c.bright; b *= g_visRgb[2] * c.bright; }
     else {
-        r = c.col[0] * c.bright; g = c.col[1] * c.bright; b = c.col[2] * c.bright;
+        r = g_visRgb[0] * c.bright; g = g_visRgb[1] * c.bright; b = g_visRgb[2] * c.bright;
         if (c.style == 2) a *= 0.55f;
     }
     ++g_visHits[g_inView ? 1 : 0];
@@ -1558,18 +2130,23 @@ static void SendFps(int fps)
     Cmd("fps_max %d", fps);
 }
 
+// какой лимит кадров считать «обычным»: обычный fps_max или значение FPS booster в режиме Engine
+static int BaseFps() { return (g_fpsBoostOn && g_fpsBoostMode == 0) ? g_fpsBoostFps : g_normalFps; }
+
 static void ApplySlow()
 {
     SetScale(g_slowOn ? (double)g_slowScale : 1.0);
-    if (!g_smooth && g_lastFps == 0) return;            // ничего не трогали, ничего не возвращаем
+    bool engineBoost = g_fpsBoostOn && g_fpsBoostMode == 0;
+    if (!g_smooth && g_lastFps == 0 && !engineBoost) return;      // ничего не трогали, ничего не возвращаем
+    int base = BaseFps();
     if (g_smooth && g_slowOn) {
-        int fps = (int)(g_normalFps / g_slowScale + 0.5f);
-        if (fps < g_normalFps) fps = g_normalFps;
+        int fps = (int)(base / g_slowScale + 0.5f);
+        if (fps < base) fps = base;
         if (fps > 1000) fps = 1000;
         SendFps(fps);
     }
     else {
-        SendFps(g_normalFps);                           // вернуть обычный лимит
+        SendFps(base);                                  // вернуть обычный лимит
     }
 }
 
@@ -1617,6 +2194,7 @@ static bool g_strafe = false;
 static int  g_strafeMode = 0;           // 0 = авто (направление задаёт взгляд), 1 = помощник (A/D по мыши)
 static int  g_strafeDirMode = 0;         // авто-режим: 0 = вперёд, 1 = влево, 2 = вправо, 3 = назад, 4 = по зажатым W/A/S/D
 static bool g_strafeJumpOnly = true;    // страфить, только пока зажат прыжок
+static float g_strafePower = 1.0f;     // мощность автострафе: 0 = перпендикулярно скорости (слабо), 1 = теоретический максимум разгона
 static bool g_gstrafe = false;          // граунд-страйф (работает, пока зажата клавиша из KEYS)
 static bool g_hookCreateMove = false;
 static int  g_theme = 0;                // 0 = Neon, 1 = Mono
@@ -1678,26 +2256,64 @@ static void DoMovement(UserCmd* cmd)
             // Камеру не трогаем: поворачиваешь мышью ты, страфы подстраиваются под неё.
             float vx = pm->velocity.x, vy = pm->velocity.y;
             if (vx * vx + vy * vy > 1.0f) {
-                float offset = 0.0f;                     // куда хотим лететь относительно взгляда
+                float offset = 0.0f;                     // куда хотим лететь относительно взгляда (против часовой = влево)
                 switch (g_strafeDirMode) {
                 case 1: offset = kPi * 0.5f; break;     // влево
                 case 2: offset = -kPi * 0.5f; break;     // вправо
                 case 3: offset = kPi;        break;     // назад
-                case 4:                                  // «авто»: куда нажаты клавиши
-                    if ((cmd->buttons & IN_MOVELEFT) && !(cmd->buttons & IN_MOVERIGHT)) offset = kPi * 0.5f;
-                    else if ((cmd->buttons & IN_MOVERIGHT) && !(cmd->buttons & IN_MOVELEFT)) offset = -kPi * 0.5f;
-                    else if (cmd->buttons & IN_BACK) offset = kPi;
+                case 4: {                                // «авто»: куда нажаты W/A/S/D, включая диагонали
+                    float kf = ((cmd->buttons & IN_FORWARD) ? 1.0f : 0.0f) - ((cmd->buttons & IN_BACK) ? 1.0f : 0.0f);
+                    float kl = ((cmd->buttons & IN_MOVELEFT) ? 1.0f : 0.0f) - ((cmd->buttons & IN_MOVERIGHT) ? 1.0f : 0.0f);
+                    if (kf != 0.0f || kl != 0.0f) offset = atan2f(kl, kf);
                     break;
+                }
                 default: break;
                 }
                 float velAng = atan2f(vy, vx);
                 float viewAng = yaw * (kPi / 180.0f);
-                float delta = NormRad(velAng - viewAng - offset);
+                float targetAng = viewAng + offset;                  // куда хотим лететь в мире
+                float delta = NormRad(velAng - targetAng);
+                float sgn = delta > 0.0f ? 1.0f : -1.0f;             // в какую сторону довернуть скорость
 
-                const float K = 400.0f;
-                float sgn = delta > 0.0f ? 1.0f : -1.0f;
-                float fwd = sgn * K * sinf(delta);
-                float side = sgn * K * cosf(delta);
+                // Воздушное ускорение движка (PM_AirAccelerate):
+                //   wishspd = min(wishspeed, 30);  addspeed = wishspd - dot(velocity, wishdir);
+                //   accelspeed = sv_airaccelerate * frametime * wishspeed   (полный wishspeed, не потолок 30);
+                //   прирост = min(accelspeed, addspeed).
+                // При полной скорости желания прирост ограничен только addspeed, и максимум достигается почти строго
+                // перпендикулярно скорости. Мощность (Power) меняет саму скорость желания: 100 % = полная.
+                static float airAccel = 10.0f, maxSpeedCv = 320.0f;
+                static int   aaTimer = 0;
+                if (aaTimer-- <= 0) {
+                    aaTimer = 200;
+                    const char* cv = g_getCvarString ? g_getCvarString("sv_airaccelerate") : nullptr;
+                    float a2 = cv ? (float)atof(cv) : 0.0f;
+                    if (a2 >= 0.1f && a2 <= 2000.0f) airAccel = a2;
+                    cv = g_getCvarString ? g_getCvarString("sv_maxspeed") : nullptr;
+                    a2 = cv ? (float)atof(cv) : 0.0f;
+                    if (a2 >= 50.0f && a2 <= 2000.0f) maxSpeedCv = a2;
+                }
+                const float cap = 30.0f;
+                float pw = g_strafePower < 0.0f ? 0.0f : (g_strafePower > 1.0f ? 1.0f : g_strafePower);
+                float K = 400.0f * pw;                                // вектор команды; движок срежет его до максимальной скорости
+                float wishFull = K < maxSpeedCv ? K : maxSpeedCv;     // полная скорость желания, как её увидит движок
+                float ft = cmd->msec > 0 ? cmd->msec * 0.001f : 0.01f;
+                float accelSpeed = airAccel * ft * wishFull;
+                // Лучший угол между желанием и скоростью: dot(v, w) = cap - accelSpeed (но не меньше нуля), т.е. acos((30 - accel) / speed)
+                float need = cap - accelSpeed;
+                if (need < 0.0f) need = 0.0f;
+                float ratio = need / sqrtf(vx * vx + vy * vy);
+                float wishAng;
+                if (ratio >= 1.0f) {
+                    wishAng = targetAng;                              // скорость мала: просто разгоняемся в нужную сторону
+                }
+                else {
+                    float ang = acosf(ratio);
+                    wishAng = velAng - sgn * ang;
+                }
+                // wishAng (мир) -> forwardmove / sidemove (относительно взгляда; вправо = +side)
+                float w = wishAng - viewAng;
+                float fwd = K * cosf(w);
+                float side = -K * sinf(w);
                 SetMoveButtons(cmd, fwd, side);
             }
         }
@@ -1732,6 +2348,10 @@ static void hkCreateMove(float frametime, UserCmd* cmd, int active)
         const PlayerMove* pm = (const PlayerMove*)g_pm;
         UpdateJumpStats(pm);
         if (g_replayActive) { ApplyReplay(cmd); return; }
+        if (g_fpsBoostOn && g_fpsBoostMode == 1 && cmd->msec > 0) {          // Cmd: физический шаг как на заданном FPS
+            int ms = (int)(1000.0f / (float)g_fpsBoostFps + 0.5f);
+            cmd->msec = (unsigned char)(ms < 1 ? 1 : (ms > 255 ? 255 : ms));
+        }
         DoMovement(cmd);
         LeadInPush(pm, cmd);
         RecordFrame(pm, cmd);
@@ -1778,6 +2398,22 @@ static void SaveConfig()
     WritePrivateProfileStringA("rec", "trail_through", g_trailThrough ? "1" : "0", g_iniPath);
     WritePrivateProfileStringA("rec", "jump_stats", g_jumpStatsOn ? "1" : "0", g_iniPath);
     WritePrivateProfileStringA("misc", "hook_gdi_swap", g_hookGdiSwap ? "1" : "0", g_iniPath);
+    WritePrivateProfileStringA("misc", "swap_iat", g_swapIat ? "1" : "0", g_iniPath);
+    WritePrivateProfileStringA("misc", "force_no_vsync", g_forceNoVsync ? "1" : "0", g_iniPath);
+    {
+        auto wb = [&](const char* k, bool x) { WritePrivateProfileStringA("view", k, x ? "1" : "0", g_iniPath); };
+        auto wf = [&](const char* k, float x) { char t[32]; snprintf(t, sizeof(t), "%.2f", x); WritePrivateProfileStringA("view", k, t, g_iniPath); };
+        wb("fov_on", g_view.fovOn); wf("fov", g_view.fov); wb("scope_keep", g_view.scopeKeep);
+        wb("aspect_on", g_view.aspectOn); wf("aspect", g_view.aspect);
+        wb("vm_fov_on", g_view.vmFovOn); wf("vm_fov", g_view.vmFov);
+        wb("off_on", g_view.offOn); wf("off_x", g_view.off[0]); wf("off_y", g_view.off[1]); wf("off_z", g_view.off[2]);
+        wb("no_recoil", g_view.noRecoil); wf("tp_dist", g_view.tpDist); wf("fov_orig", g_engFovOrig);
+        WritePrivateProfileStringA("fps_booster", "on", g_fpsBoostOn ? "1" : "0", g_iniPath);
+        snprintf(v, sizeof(v), "%d", g_fpsBoostMode); WritePrivateProfileStringA("fps_booster", "mode", v, g_iniPath);
+        snprintf(v, sizeof(v), "%d", g_fpsBoostFps);  WritePrivateProfileStringA("fps_booster", "fps", v, g_iniPath);
+    }
+    WritePrivateProfileStringA("vis", "preview_model_0", g_pvPath[0].c_str(), g_iniPath);
+    WritePrivateProfileStringA("vis", "preview_model_1", g_pvPath[1].c_str(), g_iniPath);
     {
         const char* sec[2] = { "vis_models", "vis_weapon" };
         const VisCfg* vc[2] = { &g_chams, &g_weap };
@@ -1789,6 +2425,8 @@ static void SaveConfig()
             snprintf(v, sizeof(v), "%.3f", vc[k]->col[2]); WritePrivateProfileStringA(sec[k], "b", v, g_iniPath);
             snprintf(v, sizeof(v), "%.2f", vc[k]->bright); WritePrivateProfileStringA(sec[k], "bright", v, g_iniPath);
             WritePrivateProfileStringA(sec[k], "through", vc[k]->through ? "1" : "0", g_iniPath);
+            WritePrivateProfileStringA(sec[k], "rainbow", vc[k]->rainbow ? "1" : "0", g_iniPath);
+            snprintf(v, sizeof(v), "%.2f", vc[k]->rspeed); WritePrivateProfileStringA(sec[k], "rainbow_speed", v, g_iniPath);
         }
     }
     WritePrivateProfileStringA("rec", "map_show", g_mapShow ? "1" : "0", g_iniPath);
@@ -1813,6 +2451,8 @@ static void SaveConfig()
     snprintf(v, sizeof(v), "%d", g_strafeDirMode);
     WritePrivateProfileStringA("move", "strafe_dir_mode", v, g_iniPath);
     WritePrivateProfileStringA("move", "strafe_jump_only", g_strafeJumpOnly ? "1" : "0", g_iniPath);
+    snprintf(v, sizeof(v), "%.2f", g_strafePower);
+    WritePrivateProfileStringA("move", "strafe_power", v, g_iniPath);
     WritePrivateProfileStringA("move", "gstrafe", g_gstrafe ? "1" : "0", g_iniPath);
     snprintf(v, sizeof(v), "%d", g_normalFps);
     WritePrivateProfileStringA("time", "normal_fps", v, g_iniPath);
@@ -1834,6 +2474,35 @@ static void LoadConfig()
     g_trailThrough = GetPrivateProfileIntA("rec", "trail_through", 0, g_iniPath) != 0;
     g_jumpStatsOn = GetPrivateProfileIntA("rec", "jump_stats", 0, g_iniPath) != 0;
     g_hookGdiSwap = GetPrivateProfileIntA("misc", "hook_gdi_swap", 1, g_iniPath) != 0;
+    g_swapIat = GetPrivateProfileIntA("misc", "swap_iat", 1, g_iniPath) != 0;
+    g_forceNoVsync = GetPrivateProfileIntA("misc", "force_no_vsync", 0, g_iniPath) != 0;
+    {
+        auto rb = [&](const char* k, bool d) { return GetPrivateProfileIntA("view", k, d ? 1 : 0, g_iniPath) != 0; };
+        auto rf = [&](const char* k, float d, float lo, float hi) {
+            char t[32];
+            GetPrivateProfileStringA("view", k, "", t, sizeof(t), g_iniPath);
+            if (!t[0]) return d;
+            float f = (float)atof(t);
+            return (f >= lo && f <= hi) ? f : d;
+            };
+        g_view.fovOn = rb("fov_on", false); g_view.fov = rf("fov", 100.0f, 40.0f, 160.0f); g_view.scopeKeep = rb("scope_keep", true);
+        g_view.aspectOn = rb("aspect_on", false); g_view.aspect = rf("aspect", 1.0f, 0.5f, 2.0f);
+        g_view.vmFovOn = rb("vm_fov_on", false); g_view.vmFov = rf("vm_fov", 90.0f, 30.0f, 160.0f);
+        g_view.offOn = rb("off_on", false);
+        g_view.off[0] = rf("off_x", 0.0f, -30.0f, 30.0f); g_view.off[1] = rf("off_y", 0.0f, -30.0f, 30.0f); g_view.off[2] = rf("off_z", 0.0f, -30.0f, 30.0f);
+        g_engFovOrig = rf("fov_orig", 0.0f, 0.0f, 170.0f);
+        g_view.noRecoil = rb("no_recoil", false); g_view.tpDist = rf("tp_dist", 120.0f, 30.0f, 400.0f);
+        g_fpsBoostOn = GetPrivateProfileIntA("fps_booster", "on", 0, g_iniPath) != 0;
+        g_fpsBoostMode = (int)GetPrivateProfileIntA("fps_booster", "mode", 0, g_iniPath);
+        if (g_fpsBoostMode < 0 || g_fpsBoostMode > 1) g_fpsBoostMode = 0;
+        int fb = (int)GetPrivateProfileIntA("fps_booster", "fps", 250, g_iniPath);
+        if (fb >= 20 && fb <= 1000) g_fpsBoostFps = fb;
+    }
+    {
+        char pb[300];
+        GetPrivateProfileStringA("vis", "preview_model_0", "", pb, sizeof(pb), g_iniPath); g_pvPath[0] = pb;
+        GetPrivateProfileStringA("vis", "preview_model_1", "", pb, sizeof(pb), g_iniPath); g_pvPath[1] = pb;
+    }
     {
         const char* sec[2] = { "vis_models", "vis_weapon" };
         VisCfg* vc[2] = { &g_chams, &g_weap };
@@ -1850,6 +2519,9 @@ static void LoadConfig()
             GetPrivateProfileStringA(sec[k], "bright", "", b, sizeof(b), g_iniPath);
             if (b[0]) { float f = (float)atof(b); if (f >= 0.3f && f <= 6.0f) vc[k]->bright = f; }
             vc[k]->through = GetPrivateProfileIntA(sec[k], "through", 0, g_iniPath) != 0;
+            vc[k]->rainbow = GetPrivateProfileIntA(sec[k], "rainbow", 0, g_iniPath) != 0;
+            GetPrivateProfileStringA(sec[k], "rainbow_speed", "", b, sizeof(b), g_iniPath);
+            if (b[0]) { float f = (float)atof(b); if (f >= 0.05f && f <= 3.0f) vc[k]->rspeed = f; }
         }
     }
     g_mapShow = GetPrivateProfileIntA("rec", "map_show", 1, g_iniPath) != 0;
@@ -1878,6 +2550,12 @@ static void LoadConfig()
     g_strafeDirMode = (int)GetPrivateProfileIntA("move", "strafe_dir_mode", GetPrivateProfileIntA("move", "strafe_key_dir", 0, g_iniPath) ? 4 : 0, g_iniPath);
     if (g_strafeDirMode < 0 || g_strafeDirMode > 4) g_strafeDirMode = 0;
     g_strafeJumpOnly = GetPrivateProfileIntA("move", "strafe_jump_only", 1, g_iniPath) != 0;
+    {
+        char pv[32];
+        GetPrivateProfileStringA("move", "strafe_power", "1.00", pv, sizeof(pv), g_iniPath);
+        float pf = (float)atof(pv);
+        if (pf >= 0.0f && pf <= 1.0f) g_strafePower = pf;
+    }
     g_gstrafe = GetPrivateProfileIntA("move", "gstrafe", 0, g_iniPath) != 0;
     int nf = (int)GetPrivateProfileIntA("time", "normal_fps", 100, g_iniPath);
     if (nf >= 20 && nf <= 1000) g_normalFps = nf;
@@ -2388,8 +3066,70 @@ static void PvBox(const PreviewParams& P, float cx, float cy, float cz, float hx
     }
 }
 
+// настоящая модель игры в превью: те же стили, что применяет игра (оттенок / плоский цвет / свечение)
+static void DrawMdlPreview(MdlModel& m, const PreviewParams& P)
+{
+    for (MdlTex& t : m.tex) {
+        if (t.gl || t.w <= 0 || t.rgba.empty()) continue;
+        glGenTextures(1, &t.gl);
+        glBindTexture(GL_TEXTURE_2D, t.gl);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t.w, t.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, t.rgba.data());
+    }
+
+    float cx = (m.mn[0] + m.mx[0]) * 0.5f, cy = (m.mn[1] + m.mx[1]) * 0.5f, cz = (m.mn[2] + m.mx[2]) * 0.5f;
+    float ext = fmaxf(fmaxf(m.mx[0] - m.mn[0], m.mx[1] - m.mn[1]), fmaxf(m.mx[2] - m.mn[2], 1.0f));
+    float sc = 2.1f / ext;
+    float ca = cosf(P.angle), sa = sinf(P.angle);
+    const float L[3] = { 0.40f, 0.70f, 0.60f };
+    const float ll = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
+    const VisCfg& c = P.cfg;
+    const bool textured = !c.on || c.style == 0;
+
+    glTranslatef(0.0f, 0.0f, -4.2f);
+    for (const MdlMesh& mesh : m.meshes) {
+        const MdlTex* tx = (mesh.tex >= 0 && (size_t)mesh.tex < m.tex.size()) ? &m.tex[mesh.tex] : nullptr;
+        bool useTex = textured && tx && tx->gl;
+        if (useTex) {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, tx->gl);
+            if (tx->flags & 0x40) { glEnable(GL_ALPHA_TEST); glAlphaFunc(GL_GREATER, 0.5f); }
+            else glDisable(GL_ALPHA_TEST);
+        }
+        else {
+            glDisable(GL_TEXTURE_2D);
+            glDisable(GL_ALPHA_TEST);
+        }
+        glBegin(GL_TRIANGLES);
+        for (size_t i = 0; i + 7 < mesh.v.size(); i += 8) {
+            const float* v = &mesh.v[i];
+            float x = (v[0] - cx) * sc, y = (v[1] - cy) * sc, z = (v[2] - cz) * sc;
+            float rx = x * ca - y * sa, ry = x * sa + y * ca;
+            float nx = v[3] * ca - v[4] * sa, ny = v[3] * sa + v[4] * ca, nz = v[5];
+            float vx = nx, vy = nz, vz = -ny;                              // нормаль в системе экрана (z вверх -> y вверх)
+            float d = (vx * L[0] + vy * L[1] + vz * L[2]) / ll;
+            float shade = 0.35f + 0.65f * (d > 0.0f ? d : 0.0f);
+            float r, g, b, a = 1.0f;
+            if (!c.on) { r = g = b = shade; }
+            else if (c.style == 0) { r = shade * c.col[0] * c.bright; g = shade * c.col[1] * c.bright; b = shade * c.col[2] * c.bright; }
+            else if (c.style == 1) { float k = 0.75f + 0.25f * shade; r = c.col[0] * c.bright * k; g = c.col[1] * c.bright * k; b = c.col[2] * c.bright * k; }
+            else { float k = 0.65f + 0.35f * shade; r = c.col[0] * c.bright * k; g = c.col[1] * c.bright * k; b = c.col[2] * c.bright * k; a = 0.55f; }
+            glColor4f(r, g, b, a);
+            glTexCoord2f(v[6], v[7]);
+            glVertex3f(rx, z, -ry);                                          // z вверх -> y вверх
+        }
+        glEnd();
+    }
+}
+
 static void PreviewCallback(const ImDrawList*, const ImDrawCmd* cmd)
 {
+    for (unsigned int t : g_staleTex) glDeleteTextures(1, &t);
+    g_staleTex.clear();
     const PreviewParams& P = *(const PreviewParams*)cmd->UserCallbackData;
     ImGuiIO& io = ImGui::GetIO();
     // видимая часть = пересечение окна превью и области отсечения ImGui (чтобы не вылезать при прокрутке)
@@ -2430,7 +3170,10 @@ static void PreviewCallback(const ImDrawList*, const ImDrawCmd* cmd)
     if (P.cfg.on && P.cfg.style == 2) glDepthMask(GL_FALSE);
     glLineWidth(1.0f);
 
-    if (P.kind == 0) {                                       // человечек
+    if (g_pvMdl[P.kind].ok) {
+        DrawMdlPreview(g_pvMdl[P.kind], P);
+    }
+    else if (P.kind == 0) {                                // человечек
         glTranslatef(0.0f, -0.95f, -4.6f);
         PvBox(P, 0.00f, 1.60f, 0.0f, 0.20f, 0.20f, 0.20f);    // голова
         PvBox(P, 0.00f, 1.00f, 0.0f, 0.34f, 0.42f, 0.18f);    // торс
@@ -2461,15 +3204,71 @@ static void UiPreview(int kind, const VisCfg& cfg, float h)
     if (g_dry || g_search[0]) return;
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
-    ImGui::Dummy(ImVec2(w, h));
+    ImGui::PushID(kind);
+    ImGui::InvisibleButton("##pv", ImVec2(w, h));
+    bool dragging = ImGui::IsItemActive() && ImGui::IsMouseDragging(0, 0.0f);
+    ImGui::PopID();
+    if (dragging) g_pvAngle[kind] -= ImGui::GetIO().MouseDelta.x * 0.012f;
+    else if (!ImGui::IsItemActive()) g_pvAngle[kind] += ImGui::GetIO().DeltaTime * 0.7f;
     PreviewParams& P = g_prevParams[kind];
     P.p0 = p0; P.p1 = ImVec2(p0.x + w, p0.y + h);
     P.kind = kind; P.cfg = cfg;
-    P.angle = (float)ImGui::GetTime() * 0.9f;
+    if (cfg.rainbow) RainbowColor(ImGui::GetTime(), cfg.rspeed, P.cfg.col);
+    P.angle = g_pvAngle[kind];
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddCallback(PreviewCallback, &P);
     dl->AddRect(P.p0, P.p1, Col(Neon::Palette::Border), 8.0f);
     ImGui::Dummy(ImVec2(0, 4));
+}
+
+// выбор модели для превью: кнопка с именем, во всплывающем окне список с поиском
+static void UiModelPicker(int kind, const char* label)
+{
+    if (g_dry || g_search[0]) return;
+    ImGui::PushID(label);
+    RowCtx r = UiRowBegin(label);
+    std::string shown = g_pvPath[kind].empty() ? std::string("(none)") : g_pvPath[kind];
+    size_t sl = shown.find_last_of("\\/");
+    if (sl != std::string::npos) shown = shown.substr(sl + 1);
+    UiPlaceRight(r, 220.0f);
+    char btn[160];
+    snprintf(btn, sizeof(btn), "%s##pick", shown.c_str());
+    if (ImGui::Button(btn, ImVec2(220.0f, 0))) ImGui::OpenPopup("pick_model");
+    UiRowEnd(r);
+    if (ImGui::BeginPopup("pick_model")) {
+        static char filter[2][48] = { "", "" };
+        ImGui::SetNextItemWidth(250.0f);
+        ImGui::InputTextWithHint("##flt", "filter, e.g. scientist or v_", filter[kind], sizeof(filter[kind]));
+        ImGui::SameLine(0, 8);
+        if (ImGui::Button("Rescan", ImVec2(70.0f, 0))) ScanModels();
+        ImGui::BeginChild("##models", ImVec2(340.0f, 280.0f), ImGuiChildFlags_Borders);
+        int shownCount = 0;
+        for (const std::string& m : g_models) {
+            if (filter[kind][0]) {
+                char a[260], b[48];
+                size_t i = 0;
+                for (; m[i] && i < sizeof(a) - 1; ++i) a[i] = (char)tolower((unsigned char)m[i]);
+                a[i] = 0;
+                for (i = 0; filter[kind][i] && i < sizeof(b) - 1; ++i) b[i] = (char)tolower((unsigned char)filter[kind][i]);
+                b[i] = 0;
+                if (!strstr(a, b)) continue;
+            }
+            if (++shownCount > 600) { ImGui::TextDisabled("... narrow the filter"); break; }
+            bool sel = (m == g_pvPath[kind]);
+            if (ImGui::Selectable(m.c_str(), sel)) { LoadPreviewModel(kind, m); SaveConfig(); ImGui::CloseCurrentPopup(); }
+        }
+        if (g_models.empty()) ImGui::TextDisabled("No .mdl files found next to hl.exe");
+        ImGui::EndChild();
+        ImGui::EndPopup();
+    }
+    if (!g_pvMsg[kind].empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, Neon::Palette::Magenta);
+        ImGui::PushFont(g_fontSmall);
+        ImGui::TextWrapped("%s", g_pvMsg[kind].c_str());
+        ImGui::PopFont();
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopID();
 }
 
 static bool UiColor(const char* label, float col[3])
@@ -2491,6 +3290,7 @@ static const NavItem kNav[] = {
     { "CONTROL",  "Movement", -1 },
     { "CONTROL",  "Recorder",  2 },     // вложен в Movement
     { "VISUALS",  "Models",   -1 },
+    { "VISUALS",  "View",     -1 },
     { "MISC",     "Keys",     -1 },
     { "MISC",     "Settings", -1 },
 };
@@ -2530,6 +3330,7 @@ static void BuildCards(int page, const Snapshot& s, std::vector<CardDef>& out)
         } });
         out.push_back({ "RENDER", 1, []() {
             UiInfo("Render FPS", "%.0f", ImGui::GetIO().Framerate);
+            UiInfo("Overlay cost", "%.2f ms / frame", g_overlayAvgMs);
         } });
         break;
 
@@ -2554,6 +3355,16 @@ static void BuildCards(int page, const Snapshot& s, std::vector<CardDef>& out)
   UiText("Physics frames stay the same, they just run slower.");
 }
 } });
+        out.push_back({ "FPS BOOSTER", 1, []() {
+            if (UiToggle("FPS booster", &g_fpsBoostOn)) { ApplySlow(); SaveConfig(); }
+            if (UiCombo("Mode", &g_fpsBoostMode, "Engine (frame limit)\0Cmd (physics step)\0")) { ApplySlow(); SaveConfig(); }
+            if (UiInputInt("FPS", &g_fpsBoostFps)) {
+                if (g_fpsBoostFps < 20) g_fpsBoostFps = 20;
+                if (g_fpsBoostFps > 1000) g_fpsBoostFps = 1000;
+            }
+            if (g_uiDone) { ApplySlow(); SaveConfig(); }
+            UiText("Engine: the game itself runs at this frame rate (your PC must be able to render it). Cmd: every movement command is as long as one frame of this FPS: finer physics, but the more FPS the slower you move (fps minus speed). Single-player only.");
+        } });
         out.push_back({ "SMOOTH SLOW-MO", 1, []() {
             if (UiToggle("More FPS while slowed", &g_smooth)) { ApplySlow(); SaveConfig(); }
             if (g_smooth) {
@@ -2582,6 +3393,12 @@ static void BuildCards(int page, const Snapshot& s, std::vector<CardDef>& out)
                 if (UiCombo("Mode", &g_strafeMode, "Auto (follows view)\0Helper (A/D by mouse)\0")) SaveConfig();
                 if (g_strafeMode == 0) {
                     if (UiCombo("Direction", &g_strafeDirMode, "Forward\0Left\0Right\0Back\0Auto (from W/A/S/D)\0")) SaveConfig();
+                }
+                if (g_strafeMode == 0) {
+                    float pct = g_strafePower * 100.0f;
+                    UiSlider("Power", &pct, 0.0f, 100.0f, "%.0f %%");
+                    g_strafePower = pct / 100.0f;
+                    if (g_uiDone) SaveConfig();
                 }
                 if (UiToggle("Only while jump held", &g_strafeJumpOnly)) SaveConfig();
             }
@@ -2628,57 +3445,111 @@ static void BuildCards(int page, const Snapshot& s, std::vector<CardDef>& out)
             if (UiToggle("Colour models", &g_chams.on)) SaveConfig();
             if (UiCombo("Style", &g_chams.style, "Tint (keep textures)\0Flat colour\0Glow\0")) SaveConfig();
             if (UiColor("Colour", g_chams.col)) SaveConfig();
+            if (UiToggle("Rainbow", &g_chams.rainbow)) SaveConfig();
+            if (g_chams.rainbow) { UiSlider("Rainbow speed", &g_chams.rspeed, 0.05f, 2.0f, "%.2f"); if (g_uiDone) SaveConfig(); }
             if (UiSlider("Brightness", &g_chams.bright, 0.5f, 4.0f, "%.2f")) {}
             if (g_uiDone) SaveConfig();
             if (UiToggle("Visible through walls", &g_chams.through)) SaveConfig();
-            UiText("Applies to every 3D model except your weapon: monsters, people, items. Through walls draws them on top of the level.");
+            UiText("Applies to every 3D model except your weapon: monsters, people, items. Through walls draws them on top of the level. Tint is the cheapest style, Glow the most expensive.");
         } });
         out.push_back({ "WEAPON", 0, []() {
             if (UiToggle("Colour weapon", &g_weap.on)) SaveConfig();
             if (UiCombo("Style ", &g_weap.style, "Tint (keep textures)\0Flat colour\0Glow\0")) SaveConfig();
             if (UiColor("Colour ", g_weap.col)) SaveConfig();
+            if (UiToggle("Rainbow ", &g_weap.rainbow)) SaveConfig();
+            if (g_weap.rainbow) { UiSlider("Rainbow speed ", &g_weap.rspeed, 0.05f, 2.0f, "%.2f"); if (g_uiDone) SaveConfig(); }
             if (UiSlider("Brightness ", &g_weap.bright, 0.5f, 4.0f, "%.2f")) {}
             if (g_uiDone) SaveConfig();
             UiText("Your weapon model in first person.");
         } });
         out.push_back({ "PREVIEW", 1, []() {
-            ImGui::PushFont(g_fontSmall);
-            ImGui::PushStyleColor(ImGuiCol_Text, Neon::Palette::TextDim);
-            if (!g_search[0]) ImGui::TextUnformatted("Models");
-            ImGui::PopStyleColor();
-            ImGui::PopFont();
-            UiPreview(0, g_chams, 190.0f);
-            ImGui::PushFont(g_fontSmall);
-            ImGui::PushStyleColor(ImGuiCol_Text, Neon::Palette::TextDim);
-            if (!g_search[0]) ImGui::TextUnformatted("Weapon");
-            ImGui::PopStyleColor();
-            ImGui::PopFont();
-            UiPreview(1, g_weap, 150.0f);
-            UiText("The preview shows how the settings look; it is not the real game model.");
+            EnsurePreviewModels();
+            UiModelPicker(0, "Model");
+            UiPreview(0, g_chams, 210.0f);
+            UiModelPicker(1, "Weapon model");
+            UiPreview(1, g_weap, 180.0f);
+            UiText("Real models from your game folders. Pick any other with the buttons above; drag a preview to turn it.");
         } });
         out.push_back({ "HOOK ACTIVITY", 1, []() {
             UiInfoCol("OpenGL hooks", g_glHooksOk ? Neon::Palette::Cyan : Neon::Palette::Magenta, g_glHooksOk ? "OK" : "MISSING");
             UiInfo("Colour hooks", "%d of 6", g_glColorHooks);
             UiInfo("Models recoloured / s", "%d", g_visHitsShown[0]);
             UiInfo("Weapon recoloured / s", "%d", g_visHitsShown[1]);
+            if (UiToggle("Measure overhead", &g_visProfile)) {}
+            if (g_visProfile) UiInfo("Colouring costs", "%.2f ms / s", g_visCostShown);
             UiText("If these stay at 0 while a style is on, send hltas.log: the game draws models in a way the hooks do not see.");
         } });
         break;
 
-    case 5: // ---------------------------------------------------------------- Keys
+    case 5: // ---------------------------------------------------------------- View (локальные визуалы)
+        out.push_back({ "FIELD OF VIEW", 0, []() {
+            if (!g_glHooksOk) UiText("OpenGL hooks are not installed (see hltas.log).", true);
+            if (UiToggle("Field of view", &g_view.fovOn)) SaveConfig();
+            UiSlider("Angle", &g_view.fov, 60.0f, 140.0f, "%.0f deg");
+            if (g_uiDone) SaveConfig();
+            if (UiToggle("Keep scope zoom", &g_view.scopeKeep)) SaveConfig();
+            if (UiToggle("Aspect ratio", &g_view.aspectOn)) SaveConfig();
+            UiSlider("Stretch", &g_view.aspect, 0.6f, 1.6f, "%.2f");
+            if (g_uiDone) SaveConfig();
+            UiText("Horizontal field of view of the world. It is set through the engine command default_fov, so walls are not cut off at the screen edges. Keep scope zoom leaves sniper scopes and other narrow views alone.");
+        } });
+        out.push_back({ "CAMERA", 0, []() {
+            if (UiToggle("Remove visual recoil", &g_view.noRecoil)) SaveConfig();
+            if (!g_hookRefdef) UiText("Camera hook is not installed (see hltas.log).", true);
+            bool tp = g_thirdPerson;
+            if (UiToggle("Third person", &tp)) {
+                g_thirdPerson = tp;
+                if (tp) { Cmd("cam_idealdist %.0f", g_view.tpDist); Cmd("thirdperson"); }
+                else    Cmd("firstperson");
+                SaveConfig();
+            }
+            UiSlider("Camera distance", &g_view.tpDist, 40.0f, 300.0f, "%.0f");
+            if (g_uiDone) { if (g_thirdPerson) Cmd("cam_idealdist %.0f", g_view.tpDist); SaveConfig(); }
+            UiText("Third person uses the game's own commands; some games need cheats enabled for it.");
+        } });
+        out.push_back({ "WEAPON VIEW", 1, []() {
+            if (UiToggle("Weapon field of view", &g_view.vmFovOn)) SaveConfig();
+            UiSlider("Weapon angle", &g_view.vmFov, 40.0f, 140.0f, "%.0f deg");
+            if (g_uiDone) SaveConfig();
+            if (UiToggle("Move weapon", &g_view.offOn)) SaveConfig();
+            if (g_view.offOn) {
+                UiSlider("Right", &g_view.off[0], -15.0f, 15.0f, "%.1f");
+                if (g_uiDone) SaveConfig();
+                UiSlider("Up", &g_view.off[1], -15.0f, 15.0f, "%.1f");
+                if (g_uiDone) SaveConfig();
+                UiSlider("Forward", &g_view.off[2], -15.0f, 15.0f, "%.1f");
+                if (g_uiDone) SaveConfig();
+            }
+            UiText("Changes how the weapon in your hands is drawn: a wider angle pushes it away from the centre.");
+        } });
+        out.push_back({ "ACTIVITY", 1, []() {
+            UiInfo("World view changes / s", "%d", g_viewHitsShown[0]);
+            UiInfo("Weapon view changes / s", "%d", g_viewHitsShown[1]);
+            UiInfo("Recoil removed / s", "%d", g_viewHitsShown[2]);
+            UiText("If a counter stays at 0 while its feature is on, send hltas.log: the game does that part differently.");
+        } });
+        break;
+
+    case 6: // ---------------------------------------------------------------- Keys
         out.push_back({ "BINDINGS", 0, []() {
             for (int i = 0; i < ACT_COUNT; ++i) UiKey(kActionName[i], i);
             UiText("Click a button, then press a key.  Esc - cancel,  Backspace - unbind.");
         } });
         break;
 
-    case 6: // ---------------------------------------------------------------- Settings
+    case 7: // ---------------------------------------------------------------- Settings
         out.push_back({ "INTERFACE", 0, []() {
             if (UiCombo("Theme", &g_theme, "Neon\0Mono\0")) { Neon::SetTheme(g_theme); SaveConfig(); }
         } });
+        out.push_back({ "PERFORMANCE", 0, []() {
+            if (UiToggle("Disable VSync", &g_forceNoVsync)) { g_vsyncDirty = true; SaveConfig(); }
+            UiText("Turns off vertical synchronisation at the driver level (wglSwapIntervalEXT). Frames are no longer capped to the monitor refresh rate.");
+        } });
         out.push_back({ "COMPATIBILITY", 0, []() {
+            if (UiToggle("Capture-friendly hook", &g_swapIat)) SaveConfig();
+            UiText("Hooks the frame swap inside the game engine instead of patching system functions, so it does not fight with OBS, Discord or Steam overlays. Leave it on. Needs a game restart.");
             if (UiToggle("Hook GDI SwapBuffers", &g_hookGdiSwap)) SaveConfig();
-            UiText("If a recording or streaming program (OBS, Discord) shows a black screen or freezes with the overlay on, turn this off and restart the game. Needs a restart.");
+            UiText("If a recording or streaming program still shows a black screen or freezes, try turning this off and restart the game. Needs a restart.");
         } });
         out.push_back({ "CONFIG", 0, []() {
             if (UiButton("Save config")) { SaveConfig(); g_toast = 1.6f; }
@@ -3595,16 +4466,60 @@ static bool InitImGui(HDC hdc)
     Neon::SetTheme(g_theme);
 
     g_hwnd = hwnd;
+    g_glThread = GetCurrentThreadId();
     g_origWndProc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)WndProcHook);
     g_init = true;
     Log("overlay initialised, hwnd=%p", (void*)hwnd);
     return true;
 }
 
+struct OverlayTimer
+{
+    LARGE_INTEGER t0;
+    OverlayTimer() { QueryPerformanceCounter(&t0); }
+    ~OverlayTimer() { LARGE_INTEGER t1; QueryPerformanceCounter(&t1); g_ovTicks += t1.QuadPart - t0.QuadPart; ++g_ovFrames; }
+};
+
+// Поле зрения через сам движок (default_fov): тогда он сам пересчитывает и проекцию, и отсечение невидимых стен.
+// Если только растягивать проекцию в OpenGL, на краях экрана пропадают стены (как при ноуклипе за карту).
+static void UpdateEngineFov()
+{
+    if (!g_clientCmd) return;
+    const float pi = 3.14159265358979f;
+    float asp = (g_view.aspectOn && g_view.aspect > 1.0f) ? g_view.aspect : 1.0f;
+    bool need = g_view.fovOn || asp > 1.0f;
+    unsigned long long now = GetTickCount64();
+    if (need) {
+        if (g_engFovOrig <= 0.0f) {
+            const char* cv = g_getCvarString ? g_getCvarString("default_fov") : nullptr;
+            float o = cv ? (float)atof(cv) : 0.0f;
+            g_engFovOrig = (o >= 30.0f && o <= 170.0f) ? o : 90.0f;
+            SaveConfig();
+        }
+        float fd = g_view.fovOn ? g_view.fov : g_engFovOrig;
+        float fe = 2.0f * atanf(tanf(fd * pi / 360.0f) * asp) * 180.0f / pi;     // растяжение шире 1 тоже должно попасть в отсечение
+        if (fe < 30.0f) fe = 30.0f;
+        if (fe > 170.0f) fe = 170.0f;
+        if (fabsf(fe - g_engFovSent) > 0.05f || now - g_engFovTick > 3000ULL) {
+            Cmd("default_fov %.1f", fe);
+            g_engFovSent = fe;
+            g_engFovTick = now;
+        }
+    }
+    else if (g_engFovSent > 0.0f || g_engFovOrig > 0.0f) {   // функция выключена (или игра закрылась с ней): вернуть прежнее значение
+        Cmd("default_fov %.1f", g_engFovOrig > 0.0f ? g_engFovOrig : 90.0f);
+        g_engFovSent = 0.0f;
+        g_engFovOrig = 0.0f;
+        SaveConfig();
+    }
+}
+
 static void RenderFrame(HDC hdc)
 {
+    OverlayTimer overlayTimer;
     if (!g_init && !InitImGui(hdc)) return;
     if (WindowFromDC(hdc) != g_hwnd) return;        // рисуем только в окно игры
+    if (GetCurrentThreadId() != g_glThread) return; // чужие потоки (захват OBS/Discord) не трогаем
 
     {
         static unsigned long long lastTry = 0;
@@ -3612,12 +4527,33 @@ static void RenderFrame(HDC hdc)
         if (!g_teleportOk && now - lastTry > 3000ULL) { lastTry = now; TryFindServerFuncs(); }
     }
 
+    g_visTimeSec = (double)GetTickCount64() * 0.001;
+    if (g_vsyncDirty || (g_forceNoVsync && (GetTickCount64() & 2047) < 20)) {
+        typedef BOOL(WINAPI* wglSwapInterval_t)(int);
+        static wglSwapInterval_t swapInterval = (wglSwapInterval_t)wglGetProcAddress("wglSwapIntervalEXT");
+        if (swapInterval) {
+            int want = 0;
+            if (!g_forceNoVsync) {
+                const char* v = g_getCvarString ? g_getCvarString("gl_vsync") : nullptr;
+                want = (v && atoi(v) != 0) ? 1 : 0;                 // вернуть то, что хочет игра
+            }
+            swapInterval(want);
+        }
+        g_vsyncDirty = false;
+    }
     {
         unsigned long long nowT = GetTickCount64();
         if (nowT - g_visTick >= 1000ULL) {
+            LARGE_INTEGER fq;
+            QueryPerformanceFrequency(&fq);
+            g_visCostShown = fq.QuadPart > 0 ? (double)g_visTicks * 1000.0 / (double)fq.QuadPart : 0.0;
+            g_overlayAvgMs = (fq.QuadPart > 0 && g_ovFrames > 0) ? (double)g_ovTicks * 1000.0 / (double)fq.QuadPart / (double)g_ovFrames : 0.0;
+            g_ovTicks = 0; g_ovFrames = 0;
+            g_visTicks = 0;
             g_visTick = nowT;
             g_visHitsShown[0] = g_visHits[0]; g_visHitsShown[1] = g_visHits[1];
             g_visHits[0] = g_visHits[1] = 0;
+            for (int i = 0; i < 3; ++i) { g_viewHitsShown[i] = g_viewHits[i]; g_viewHits[i] = 0; }
         }
     }
 
@@ -3628,6 +4564,7 @@ static void RenderFrame(HDC hdc)
     ImGui::NewFrame();
 
     UpdateStep();
+    UpdateEngineFov();
     Snapshot s = ReadPlayer();
     DrawHud(s);
     if (g_menu) DrawMenu(s);
@@ -3636,11 +4573,63 @@ static void RenderFrame(HDC hdc)
     ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
 }
 
+// Подмена записи в таблице импорта модуля: меняем только указатель внутри hw.dll, сами функции системы не трогаем.
+// OBS, Discord и Steam правят начало SwapBuffers / wglSwapBuffers; два перехвата одной функции мешают друг другу
+// (чёрный кадр, зависание). Таблица импорта движка принадлежит только нам, поэтому конфликта нет.
+static bool PatchImport(HMODULE mod, const char* dllName, const char* funcName, void* newFn, void** orig)
+{
+    if (!mod) return false;
+    BYTE* base = (BYTE*)mod;
+    auto nt = (PIMAGE_NT_HEADERS)(base + ((PIMAGE_DOS_HEADER)base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return false;
+    for (auto d = (PIMAGE_IMPORT_DESCRIPTOR)(base + dir.VirtualAddress); d->Name; ++d) {
+        if (_stricmp((const char*)(base + d->Name), dllName) != 0) continue;
+        auto names = (PIMAGE_THUNK_DATA)(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
+        auto addrs = (PIMAGE_THUNK_DATA)(base + d->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++addrs) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            auto ibn = (PIMAGE_IMPORT_BY_NAME)(base + names->u1.AddressOfData);
+            if (strcmp((const char*)ibn->Name, funcName) != 0) continue;
+            DWORD old = 0;
+            if (!VirtualProtect(&addrs->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) return false;
+            *orig = (void*)addrs->u1.Function;
+            addrs->u1.Function = (ULONG_PTR)newFn;
+            VirtualProtect(&addrs->u1.Function, sizeof(void*), old, &old);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Оверлей рисуем в конце кадра игры (HUD_Redraw), ДО обмена буферов. Тогда OBS/Discord видят уже готовую картинку
+// независимо от того, чей перехват SwapBuffers стоит первым. Если игра HUD_Redraw не вызвала (например, консоль),
+// оверлей дорисует перехват обмена буферов, как раньше.
+typedef int(__cdecl* HudRedraw_t)(float, int);
+static HudRedraw_t oHudRedraw = nullptr;
+static bool g_hookHudRedraw = false;
+static volatile bool g_drawnThisFrame = false;
+
+static int __cdecl hkHudRedraw(float time, int intermission)
+{
+    int r = oHudRedraw ? oHudRedraw(time, intermission) : 0;
+    if (!g_inSwap) {
+        HDC dc = wglGetCurrentDC();
+        if (dc) {
+            g_inSwap = true;
+            RenderFrame(dc);
+            g_inSwap = false;
+            g_drawnThisFrame = true;
+        }
+    }
+    return r;
+}
+
 static BOOL WINAPI hkWglSwap(HDC hdc)
 {
     if (g_inSwap) return oWglSwap(hdc);
     g_inSwap = true;
-    RenderFrame(hdc);
+    if (g_drawnThisFrame) g_drawnThisFrame = false; else RenderFrame(hdc);
     BOOL r = oWglSwap(hdc);
     g_inSwap = false;
     return r;
@@ -3650,7 +4639,7 @@ static BOOL WINAPI hkGdiSwap(HDC hdc)
 {
     if (g_inSwap) return oGdiSwap(hdc);
     g_inSwap = true;
-    RenderFrame(hdc);
+    if (g_drawnThisFrame) g_drawnThisFrame = false; else RenderFrame(hdc);
     BOOL r = oGdiSwap(hdc);
     g_inSwap = false;
     return r;
@@ -3680,14 +4669,34 @@ static DWORD WINAPI InitThread(LPVOID)
 
     if (MH_Initialize() != MH_OK) { Log("MH_Initialize failed"); return 0; }
 
-    if (MH_CreateHookApi(L"opengl32", "wglSwapBuffers", (LPVOID)hkWglSwap, (LPVOID*)&oWglSwap) != MH_OK)
-        Log("hook wglSwapBuffers failed");
-    if (g_hookGdiSwap) {
-        if (MH_CreateHookApi(L"gdi32", "SwapBuffers", (LPVOID)hkGdiSwap, (LPVOID*)&oGdiSwap) != MH_OK)
-            Log("hook SwapBuffers failed");
-    }
-    else {
-        Log("gdi32!SwapBuffers hook disabled by settings (hook_gdi_swap=0)");
+    {
+        bool wglDone = false, gdiDone = false;
+        if (g_swapIat) {
+            HMODULE eng = GetModuleHandleA("hw.dll");
+            if (!eng) eng = GetModuleHandleA("sw.dll");
+            if (eng) {
+                wglDone = PatchImport(eng, "opengl32.dll", "wglSwapBuffers", (void*)hkWglSwap, (void**)&oWglSwap);
+                if (g_hookGdiSwap)
+                    gdiDone = PatchImport(eng, "gdi32.dll", "SwapBuffers", (void*)hkGdiSwap, (void**)&oGdiSwap);
+            }
+            Log("frame hook via engine import table: wglSwapBuffers %s, SwapBuffers %s",
+                wglDone ? "yes" : "no", gdiDone ? "yes" : (g_hookGdiSwap ? "no" : "off"));
+        }
+        // Движок вызывает один из двух вариантов. Если хотя бы один найден в его таблице импорта, обычные перехваты
+        // не нужны. Иначе (функции берутся через GetProcAddress) ставим как раньше, прямой правкой функций.
+        if (!wglDone && !gdiDone) {
+            if (MH_CreateHookApi(L"opengl32", "wglSwapBuffers", (LPVOID)hkWglSwap, (LPVOID*)&oWglSwap) != MH_OK)
+                Log("hook wglSwapBuffers failed");
+            else Log("frame hook: wglSwapBuffers by inline hook");
+            if (g_hookGdiSwap) {
+                if (MH_CreateHookApi(L"gdi32", "SwapBuffers", (LPVOID)hkGdiSwap, (LPVOID*)&oGdiSwap) != MH_OK)
+                    Log("hook SwapBuffers failed");
+                else Log("frame hook: SwapBuffers by inline hook");
+            }
+            else {
+                Log("gdi32!SwapBuffers hook disabled by settings (hook_gdi_swap=0)");
+            }
+        }
     }
     {
         int ok = 0, total = 0;
@@ -3698,6 +4707,7 @@ static DWORD WINAPI InitThread(LPVOID)
         hk("glBegin", (LPVOID)hkGlBegin, (LPVOID*)&oGlBegin);
         hk("glEnd", (LPVOID)hkGlEnd, (LPVOID*)&oGlEnd);
         hk("glDepthRange", (LPVOID)hkGlDepthRange, (LPVOID*)&oGlDepthRange);
+        hk("glFrustum", (LPVOID)hkGlFrustum, (LPVOID*)&oGlFrustum);
         int before = ok;
         hk("glColor3f", (LPVOID)hkGlColor3f, (LPVOID*)&oGlColor3f);
         hk("glColor3fv", (LPVOID)hkGlColor3fv, (LPVOID*)&oGlColor3fv);
@@ -3742,6 +4752,12 @@ static DWORD WINAPI InitThread(LPVOID)
             else {
                 Log("hook HUD_DrawTransparentTriangles failed (trail in world unavailable)");
             }
+            void* hr = (void*)GetProcAddress(client, "HUD_Redraw");
+            if (hr && MH_CreateHook(hr, (LPVOID)hkHudRedraw, (LPVOID*)&oHudRedraw) == MH_OK) { g_hookHudRedraw = true; Log("hook HUD_Redraw ok (overlay is drawn before buffer swap)"); }
+            else Log("hook HUD_Redraw failed (overlay is drawn in SwapBuffers hook)");
+            void* rd = (void*)GetProcAddress(client, "V_CalcRefdef");
+            if (rd && MH_CreateHook(rd, (LPVOID)hkCalcRefdef, (LPVOID*)&oCalcRefdef) == MH_OK) { g_hookRefdef = true; Log("hook V_CalcRefdef ok"); }
+            else Log("hook V_CalcRefdef failed (visual recoil removal unavailable)");
             void* cm = (void*)GetProcAddress(client, "CL_CreateMove");
             if (cm && MH_CreateHook(cm, (LPVOID)hkCreateMove, (LPVOID*)&oCreateMove) == MH_OK) {
                 g_hookCreateMove = true;
